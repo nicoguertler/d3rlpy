@@ -14,7 +14,7 @@ from cython.parallel import prange
 
 from dataset cimport CTransition
 from libc.string cimport memcpy, memset
-from libcpp cimport bool, nullptr
+from libcpp cimport bool, nullptr, vector
 from libcpp.memory cimport make_shared, shared_ptr
 
 from .logger import LOG
@@ -1336,6 +1336,354 @@ cdef class TransitionMiniBatch:
             observations_ptr=next_observations_ptr,
             n_frames=n_frames,
             is_image=is_image,
+            is_next=True
+        )
+        terminals_ptr[batch_index] = next_ptr.get().terminal
+        n_steps_ptr[batch_index] = i + 1
+
+    @property
+    def observations(self):
+        """ Returns mini-batch of observations at `t`.
+
+        Returns:
+            numpy.ndarray or torch.Tensor: observations at `t`.
+
+        """
+        return self._observations
+
+    @property
+    def actions(self):
+        """ Returns mini-batch of actions at `t`.
+
+        Returns:
+            numpy.ndarray: actions at `t`.
+
+        """
+        return self._actions
+
+    @property
+    def rewards(self):
+        """ Returns mini-batch of rewards at `t`.
+
+        Returns:
+            numpy.ndarray: rewards at `t`.
+
+        """
+        return self._rewards
+
+    @property
+    def next_observations(self):
+        """ Returns mini-batch of observations at `t+n`.
+
+        Returns:
+            numpy.ndarray or torch.Tensor: observations at `t+n`.
+
+        """
+        return self._next_observations
+
+    @property
+    def terminals(self):
+        """ Returns mini-batch of terminal flags at `t+n`.
+
+        Returns:
+            numpy.ndarray: terminal flags at `t+n`.
+
+        """
+        return self._terminals
+
+    @property
+    def n_steps(self):
+        """ Returns mini-batch of the number of steps before next observations.
+
+        This will always include only ones if ``n_steps=1``. If ``n_steps`` is
+        bigger than ``1``. the values will depend on its episode length.
+
+        Returns:
+            numpy.ndarray: the number of steps before next observations.
+
+        """
+        return self._n_steps
+
+    @property
+    def transitions(self):
+        """ Returns transitions.
+
+        Returns:
+            d3rlpy.dataset.Transition: list of transitions.
+
+        """
+        return self._transitions
+
+    def size(self):
+        """ Returns size of mini-batch.
+
+        Returns:
+            int: mini-batch size.
+
+        """
+        return len(self._transitions)
+
+    def __len__(self):
+        return self.size()
+
+    def __getitem__(self, index):
+        return self._transitions[index]
+
+    def __iter__(self):
+        return iter(self._transitions)
+
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+cdef void _stack_frames_stepped(
+    TransitionPtr transition,
+    UINT8_t* stack,
+    vector[int] steps,
+    bool stack_next=False,
+) nogil:
+    cdef UINT8_t* observation_ptr
+    cdef int obs_size = transition.get().observation_shape[0]
+    cdef int n_frames = steps.size()
+
+    # fill terminal observation with zeros (Is this actually necessary?)
+    if stack_next and transition.get().terminal:
+        memset(stack, 0, obs_size * n_frames)
+        return
+
+    # stack frames
+    cdef TransitionPtr t = transition
+    cdef int j
+    cdef int head
+    cdef int tail
+    cdef int offset
+    # index of observation within stack (but not necessarily in episode 
+    # if step > 0)
+    cdef int i = 0
+
+    for step in steps:
+        tail = n_frames - i
+        head = tail - 1
+
+        # go backwards 'step' times
+        for _ in range(step):
+            t = t.get().prev_transition
+
+        if stack_next:
+            observation_ptr = t.get().next_observation_i
+        else:
+            observation_ptr = t.get().observation_i
+
+        memcpy(stack + head * obs_size, observation_ptr, obs_size)
+
+        if t.get().prev_transition == nullptr:
+            # fill rests with the last frame (actually the first frame)
+            for j in range(n_frames - i - 1):
+                tail = n_frames - (i + j + 1)
+                head = tail - 1
+                memcpy(stack + head * obs_size, t.get().observation_i, obs_size)
+            break
+        
+        i += 1
+
+
+cdef class SteppedTransitionMiniBatch:
+    """Mini batch of transitions with stacked frame stacking.
+    
+    Stacked frame stepping refers to going back a predefined number of
+    time steps when stacking observations into a new observation. Does
+    not assume the observation is an image. Expects flat vectors as
+    observations. The argument 'steps' refers to the steps when stacking
+    observations and not n-step returns."""
+
+    cdef list _transitions
+    cdef np.ndarray _observations
+    cdef np.ndarray _actions
+    cdef np.ndarray _rewards
+    cdef np.ndarray _next_observations
+    cdef np.ndarray _terminals
+    cdef np.ndarray _n_steps
+
+    def __cinit__(
+        self,
+        list transitions not None,
+        vector[int] steps,
+        int n_steps=1,
+        float gamma=0.99
+    ):
+        self._transitions = transitions
+
+        # determine observation shape
+        cdef tuple observation_shape = transitions[0].get_observation_shape()
+        cdef int observation_ndim = len(observation_shape)
+        observation_dtype = transitions[0].observation.dtype
+        n_frames = steps.size()
+        if n_frames > 1:
+            obs_size = observation_shape[0]
+            observation_shape = (n_frames * obs_size)
+
+        # determine action shape
+        cdef int action_size = transitions[0].get_action_size()
+        cdef tuple action_shape = tuple()
+        action_dtype = np.int32
+        if isinstance(transitions[0].action, np.ndarray):
+            action_shape = (action_size,)
+            action_dtype = np.float32
+
+        # allocate batch data
+        cdef int size = len(transitions)
+        self._observations = np.empty(
+            (size,) + observation_shape, dtype=observation_dtype
+        )
+        self._actions = np.empty((size,) + action_shape, dtype=action_dtype)
+        self._rewards = np.empty((size, 1), dtype=np.float32)
+        self._next_observations = np.empty(
+            (size,) + observation_shape, dtype=observation_dtype
+        )
+        self._terminals = np.empty((size, 1), dtype=np.float32)
+        self._n_steps = np.empty((size, 1), dtype=np.float32)
+
+        # determine flags
+        cdef bool is_dicsrete
+        is_discrete = not isinstance(transitions[0].action, np.ndarray)
+
+        # prepare pointers to batch data
+        cdef void* observations_ptr = self._observations.data
+        cdef void* actions_ptr = self._actions.data
+        cdef FLOAT_t* rewards_ptr = <FLOAT_t*> self._rewards.data
+        cdef void* next_observations_ptr = self._next_observations.data
+        cdef FLOAT_t* terminals_ptr = <FLOAT_t*> self._terminals.data
+        cdef FLOAT_t* n_steps_ptr = <FLOAT_t*> self._n_steps.data
+
+        # get pointers to transitions
+        cdef int i
+        cdef Transition transition
+        cdef vector[TransitionPtr] transition_ptrs
+        for i in range(size):
+            transition = transitions[i]
+            transition_ptrs.push_back(transition.get_ptr())
+
+        # efficient memory copy
+        cdef TransitionPtr ptr
+        for i in prange(size, nogil=True):
+            ptr = transition_ptrs[i]
+            self._assign_to_batch(
+                batch_index=i,
+                ptr=ptr,
+                observations_ptr=observations_ptr,
+                actions_ptr=actions_ptr,
+                rewards_ptr=rewards_ptr,
+                next_observations_ptr=next_observations_ptr,
+                terminals_ptr=terminals_ptr,
+                n_steps_ptr=n_steps_ptr,
+                steps=steps,
+                n_steps=n_steps,
+                gamma=gamma,
+                is_discrete=is_discrete
+            )
+
+    cdef void _assign_observation(
+        self,
+        int batch_index,
+        TransitionPtr ptr,
+        void* observations_ptr,
+        vector[int] steps,
+        bool is_next
+    ) nogil:
+        cdef int offset, obs_size
+        cdef void* src_observation_ptr
+        # if steps vector is empty, do not use stepped frame stacking
+        cdef int n_frames = steps.size()
+        if n_frames > 0:
+            obs_size = ptr.get().observation_shape[0]
+            offset = n_frames * batch_index * obs_size
+            _stack_frames_stepped(
+                transition=ptr,
+                stack=(<UINT8_t*> observations_ptr) + offset,
+                steps=steps,
+                stack_next=is_next
+            )
+        else:
+            offset = batch_index * ptr.get().observation_shape[0]
+            if is_next:
+                src_observation_ptr = ptr.get().next_observation_f
+            else:
+                src_observation_ptr = ptr.get().observation_f
+            memcpy(
+                (<FLOAT_t*> observations_ptr) + offset,
+                <FLOAT_t*> src_observation_ptr,
+                ptr.get().observation_shape[0] * sizeof(FLOAT_t)
+            )
+
+    cdef void _assign_action(
+        self,
+        int batch_index,
+        TransitionPtr ptr,
+        void* actions_ptr,
+        bool is_discrete,
+    ) nogil:
+        cdef int offset
+        cdef void* src_action_ptr
+        if is_discrete:
+            ((<INT_t*> actions_ptr) + batch_index)[0] = ptr.get().action_i
+        else:
+            offset = batch_index * ptr.get().action_size
+            src_action_ptr = ptr.get().action_f
+            memcpy(
+                (<FLOAT_t*> actions_ptr) + offset,
+                <FLOAT_t*> src_action_ptr,
+                ptr.get().action_size * sizeof(FLOAT_t)
+            )
+
+    cdef void _assign_to_batch(
+        self,
+        int batch_index,
+        TransitionPtr ptr,
+        void* observations_ptr,
+        void* actions_ptr,
+        float* rewards_ptr,
+        void* next_observations_ptr,
+        float* terminals_ptr,
+        float* n_steps_ptr,
+        vector[int] steps,
+        int n_steps,
+        float gamma,
+        bool is_discrete
+    ) nogil:
+        cdef int i
+        cdef float n_step_return = 0.0
+        cdef TransitionPtr next_ptr
+
+        # assign data at t
+        self._assign_observation(
+            batch_index=batch_index,
+            ptr=ptr,
+            observations_ptr=observations_ptr,
+            steps=steps,
+            is_next=False
+        )
+        self._assign_action(
+            batch_index=batch_index,
+            ptr=ptr,
+            actions_ptr=actions_ptr,
+            is_discrete=is_discrete,
+        )
+
+        # compute N-step return
+        next_ptr = ptr
+        for i in range(n_steps):
+            n_step_return += next_ptr.get().reward * gamma ** i
+            if next_ptr.get().next_transition == nullptr or i == n_steps - 1:
+                break
+            next_ptr = next_ptr.get().next_transition
+
+        rewards_ptr[batch_index] = n_step_return
+
+        # assign data at t+N
+        self._assign_observation(
+            batch_index=batch_index,
+            ptr=next_ptr,
+            observations_ptr=next_observations_ptr,
+            steps=steps,
             is_next=True
         )
         terminals_ptr[batch_index] = next_ptr.get().terminal
