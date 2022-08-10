@@ -1,33 +1,34 @@
+from tkinter import W
 from typing import List
 
 from ..dataset import Transition, SteppedTransitionMiniBatch
-from .random_iterator import RandomIterator
+from .round_iterator import RoundIterator
 
 
-class SteppedRandomIterator(RandomIterator):
+class SteppedRoundIterator(RoundIterator):
 
     def __init__(
         self,
         transitions: List[Transition],
-        n_steps_per_epoch: int,
         batch_size: int,
         n_steps: int = 1,
         gamma: float = 0.99,
         steps: List[int] = [],
         real_ratio: float = 1.0,
         generated_maxlen: int = 100000,
+        shuffle: bool = True,
     ):
         self._steps = steps
         n_frames = max(len(steps), 1)
         super().__init__(
             transitions=transitions,
-            n_steps_per_epoch=n_steps_per_epoch,
             batch_size=batch_size,
             n_steps=n_steps,
             gamma=gamma,
             n_frames=n_frames,
             real_ratio=real_ratio,
-            generated_maxlen=generated_maxlen
+            generated_maxlen=generated_maxlen,
+            shuffle=shuffle
         )
 
     def __next__(self) -> SteppedTransitionMiniBatch:

@@ -1,30 +1,29 @@
-
 import numpy as np
 import pytest
 
 from d3rlpy.dataset import Episode, Transition
-from d3rlpy.iterators.stepped_random_iterator import SteppedRandomIterator
+from d3rlpy.iterators.stepped_round_iterator import SteppedRoundIterator
 
 
 @pytest.mark.parametrize("episode_size", [100])
-@pytest.mark.parametrize("n_steps_per_epoch", [10])
 @pytest.mark.parametrize("n_episodes", [2])
 @pytest.mark.parametrize("observation_size", [10])
 @pytest.mark.parametrize("action_size", [2])
 @pytest.mark.parametrize("batch_size", [32])
 @pytest.mark.parametrize("steps", [[], [0, 1, 5]])
+@pytest.mark.parametrize("shuffle", [False, True])
 @pytest.mark.parametrize("real_ratio", [0.5])
 @pytest.mark.parametrize("generated_maxlen", [10])
-def test_random_iterator(
+def test_stepped_round_iterator(
     episode_size,
-    n_steps_per_epoch,
     n_episodes,
     observation_size,
     action_size,
     batch_size,
+    steps,
+    shuffle,
     real_ratio,
     generated_maxlen,
-    steps
 ):
     episodes = []
     for _ in range(n_episodes):
@@ -45,13 +44,13 @@ def test_random_iterator(
     for episode in episodes:
         orig_transitions += episode.transitions
 
-    iterator = SteppedRandomIterator(
+    iterator = SteppedRoundIterator(
         orig_transitions,
-        n_steps_per_epoch,
         batch_size,
         steps=steps,
         real_ratio=real_ratio,
         generated_maxlen=generated_maxlen,
+        shuffle=shuffle
     )
 
     # check without generated transitions
@@ -62,8 +61,8 @@ def test_random_iterator(
         assert batch.actions.shape == (batch_size, action_size)
         assert batch.rewards.shape == (batch_size, 1)
         count += 1
-    assert count == n_steps_per_epoch
-    assert len(iterator) == n_steps_per_epoch
+    assert count == episode_size * n_episodes // batch_size
+    assert len(iterator) == episode_size * n_episodes // batch_size
 
     # check adding generated transitions
     transitions = []
@@ -89,5 +88,6 @@ def test_random_iterator(
         assert batch.rewards.shape == (batch_size, 1)
         assert batch.terminals.sum() == int(batch_size * (1 - real_ratio))
         count += 1
-    assert count == n_steps_per_epoch
-    assert len(iterator) == n_steps_per_epoch
+    real_batch_size = real_ratio * batch_size
+    assert count == episode_size * n_episodes // real_batch_size
+    assert len(iterator) == episode_size * n_episodes // real_batch_size
