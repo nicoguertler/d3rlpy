@@ -11,6 +11,7 @@ from d3rlpy.dataset import (
     MDPDataset,
     Transition,
     TransitionMiniBatch,
+    SteppedTransitionMiniBatch,
     _check_discrete_action,
 )
 
@@ -386,6 +387,105 @@ def test_transition_minibatch(
             next_window = padded_observations[head_index + n : tail_index + n]
             ref_observation = np.vstack(window)
             ref_next_observation = np.vstack(next_window)
+            assert observation.shape == ref_observation.shape
+            assert next_observation.shape == ref_next_observation.shape
+            assert np.all(observation == ref_observation)
+            if i >= data_size - n_steps:
+                assert np.all(next_observation == 0)
+            else:
+                assert np.all(next_observation == ref_next_observation)
+        else:
+            next_t = t
+            for _ in range(n - 1):
+                next_t = next_t.next_transition
+            assert np.allclose(observation, t.observation)
+            assert np.allclose(next_observation, next_t.next_observation)
+
+        n_step_reward = 0.0
+        terminal = 0.0
+        next_t = t
+        for j in range(n):
+            n_step_reward += rewards[i + j] * gamma**j
+            terminal = next_t.terminal
+            next_t = next_t.next_transition
+
+        assert np.all(batch.actions[i] == t.action)
+        assert np.allclose(batch.rewards[i][0], n_step_reward)
+        assert np.all(batch.terminals[i][0] == terminal)
+
+    # check list-like behavior
+    assert len(batch) == data_size
+    assert batch[0] is episode.transitions[0]
+    for i, transition in enumerate(batch):
+        assert isinstance(transition, Transition)
+        assert transition is episode.transitions[i]
+
+
+@pytest.mark.parametrize("data_size", [100])
+@pytest.mark.parametrize("observation_shape", [(50,)])
+@pytest.mark.parametrize("action_size", [2])
+@pytest.mark.parametrize("steps", [[0, 1, 5, 7], []]) # TODO: [0, 1, 5, 7]
+@pytest.mark.parametrize("n_steps", [1, 3])
+@pytest.mark.parametrize("gamma", [0.99])
+@pytest.mark.parametrize("discrete_action", [False, True])
+def test_stepped_transition_minibatch(
+    data_size,
+    observation_shape,
+    action_size,
+    steps,
+    n_steps,
+    gamma,
+    discrete_action,
+):
+    n_frames = len(steps)
+    if n_frames > 0:
+        max_step = max(steps)
+    else:
+        max_step = 0
+    observations = np.random.random(
+        (data_size,) + observation_shape
+    ).astype("f4")
+    if discrete_action:
+        actions = np.random.randint(action_size, size=data_size)
+    else:
+        actions = np.random.random((data_size, action_size)).astype("f4")
+    rewards = np.random.random((data_size, 1)).astype("f4")
+
+    episode = Episode(
+        observation_shape=observation_shape,
+        action_size=action_size,
+        observations=observations,
+        actions=actions,
+        rewards=rewards,
+    )
+
+    if n_frames > 0:
+        batched_observation_shape = (data_size, n_frames * observation_shape[0])
+    else:
+        batched_observation_shape = (data_size, *observation_shape)
+
+    batch = SteppedTransitionMiniBatch(episode.transitions, steps, n_steps, gamma)
+    assert batch.observations.shape == batched_observation_shape
+    assert batch.next_observations.shape == batched_observation_shape
+
+    for i, t in enumerate(episode.transitions):
+        observation = batch.observations[i]
+        next_observation = batch.next_observations[i]
+        n = int(batch.n_steps[i][0])
+
+        assert n == min(data_size - i, n_steps)
+
+        if n_frames > 0:
+            # create padded observations for check stacking
+            pad = ((max_step, 1), (0, 0))
+            padded_observations = np.pad(observations, pad, "edge")
+
+            # check frame stacking
+            obs_indices = [i + max_step - j for j in steps[::-1]]
+            obs_list = [padded_observations[index] for index in obs_indices]
+            obs_list_next = [padded_observations[index + n] for index in obs_indices]
+            ref_observation = np.concatenate(obs_list)
+            ref_next_observation = np.concatenate(obs_list_next)
             assert observation.shape == ref_observation.shape
             assert next_observation.shape == ref_next_observation.shape
             assert np.all(observation == ref_observation)

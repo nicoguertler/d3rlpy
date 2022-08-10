@@ -1437,21 +1437,23 @@ cdef class TransitionMiniBatch:
 @cython.wraparound(False)
 cdef void _stack_frames_stepped(
     TransitionPtr transition,
-    UINT8_t* stack,
+    FLOAT_t* stack,
     vector[int] steps,
     bool stack_next=False,
 ) nogil:
-    cdef UINT8_t* observation_ptr
+    cdef FLOAT_t* observation_ptr
     cdef int obs_size = transition.get().observation_shape[0]
     cdef int n_frames = steps.size()
+    cdef int float_size = sizeof(FLOAT_t) # size of one float in bytes
 
     # fill terminal observation with zeros (Is this actually necessary?)
     if stack_next and transition.get().terminal:
-        memset(stack, 0, obs_size * n_frames)
+        memset(stack, 0, obs_size * n_frames * float_size)
         return
 
     # stack frames
     cdef TransitionPtr t = transition
+    cdef TransitionPtr prev
     cdef int j
     cdef int head
     cdef int tail
@@ -1459,41 +1461,59 @@ cdef void _stack_frames_stepped(
     # index of observation within stack (but not necessarily in episode 
     # if step > 0)
     cdef int i = 0
+    cdef int current_step = 0
+    cdef bool before_first_obs
 
     for step in steps:
         tail = n_frames - i
         head = tail - 1
 
-        # go backwards 'step' times
-        for _ in range(step):
-            t = t.get().prev_transition
+        before_first_obs = False
+        # go backwards according to step
+        while current_step < step:
+            prev = t.get().prev_transition
+            if prev == nullptr:
+                before_first_obs = True
+                break
+            t = prev
+            current_step += 1
 
-        if stack_next:
-            observation_ptr = t.get().next_observation_i
+        # second condition is necessary to allow for first observation
+        # as next observation
+        if stack_next and not before_first_obs:
+            observation_ptr = t.get().next_observation_f
         else:
-            observation_ptr = t.get().observation_i
+            observation_ptr = t.get().observation_f
 
-        memcpy(stack + head * obs_size, observation_ptr, obs_size)
+        memcpy(stack + head * obs_size, observation_ptr, obs_size * float_size)
 
         if t.get().prev_transition == nullptr:
             # fill rests with the last frame (actually the first frame)
             for j in range(n_frames - i - 1):
                 tail = n_frames - (i + j + 1)
                 head = tail - 1
-                memcpy(stack + head * obs_size, t.get().observation_i, obs_size)
+                memcpy(stack + head * obs_size, t.get().observation_f, obs_size * float_size)
             break
         
         i += 1
 
 
 cdef class SteppedTransitionMiniBatch:
-    """Mini batch of transitions with stacked frame stacking.
+    """Mini batch of transitions with configurable frame stacking.
     
-    Stacked frame stepping refers to going back a predefined number of
+    Stepped frame stacking refers to going back a predefined number of
     time steps when stacking observations into a new observation. Does
     not assume the observation is an image. Expects flat vectors as
-    observations. The argument 'steps' refers to the steps when stacking
-    observations and not n-step returns."""
+    observations. The argument 'steps_list' refers to the steps when
+    stacking observations and not n-step returns.
+    
+    Assume steps_list = [0, 3, 7]. The new observation at time t will then 
+    be 
+    ```
+    new_o[t] = np.concatenate([o[t - 7], o[t - 3], o[t - 0]])
+    ```
+    If steps_list is empty, no frame stacking will be applied.
+    """
 
     cdef list _transitions
     cdef np.ndarray _observations
@@ -1506,20 +1526,23 @@ cdef class SteppedTransitionMiniBatch:
     def __cinit__(
         self,
         list transitions not None,
-        vector[int] steps,
+        list steps_list,
         int n_steps=1,
         float gamma=0.99
     ):
+        cdef vector[int] steps
+        for step in steps_list:
+            steps.push_back(step)
+
         self._transitions = transitions
 
         # determine observation shape
         cdef tuple observation_shape = transitions[0].get_observation_shape()
-        cdef int observation_ndim = len(observation_shape)
         observation_dtype = transitions[0].observation.dtype
         n_frames = steps.size()
-        if n_frames > 1:
+        if n_frames > 0:
             obs_size = observation_shape[0]
-            observation_shape = (n_frames * obs_size)
+            observation_shape = (n_frames * obs_size, )
 
         # determine action shape
         cdef int action_size = transitions[0].get_action_size()
@@ -1598,7 +1621,7 @@ cdef class SteppedTransitionMiniBatch:
             offset = n_frames * batch_index * obs_size
             _stack_frames_stepped(
                 transition=ptr,
-                stack=(<UINT8_t*> observations_ptr) + offset,
+                stack=(<FLOAT_t*> observations_ptr) + offset,
                 steps=steps,
                 stack_next=is_next
             )
@@ -1652,6 +1675,7 @@ cdef class SteppedTransitionMiniBatch:
         cdef int i
         cdef float n_step_return = 0.0
         cdef TransitionPtr next_ptr
+
 
         # assign data at t
         self._assign_observation(
