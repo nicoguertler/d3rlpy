@@ -733,6 +733,8 @@ class LearnableBase:
             image_size = observation_shape[1:]
             # frame stacking for image observation
             observation_shape = (self._n_frames * n_channels, *image_size)
+        elif self._n_frames > 1:
+            observation_shape = (self._n_frames * observation_shape[0], ) + observation_shape[1:]
         return observation_shape
 
     def update(self, batch: TransitionMiniBatch) -> Dict[str, float]:

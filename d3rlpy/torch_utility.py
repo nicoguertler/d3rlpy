@@ -9,7 +9,7 @@ from torch.optim import Optimizer
 from torch.utils.data._utils.collate import default_collate
 from typing_extensions import Protocol
 
-from .dataset import TransitionMiniBatch
+from .dataset import SteppedTransitionMiniBatch, TransitionMiniBatch
 from .preprocessing import ActionScaler, RewardScaler, Scaler
 
 BLACK_LIST = [
@@ -161,7 +161,7 @@ class TorchMiniBatch:
 
     def __init__(
         self,
-        batch: TransitionMiniBatch,
+        batch: Union[TransitionMiniBatch, SteppedTransitionMiniBatch],
         device: str,
         scaler: Optional[Scaler] = None,
         action_scaler: Optional[ActionScaler] = None,
@@ -256,7 +256,7 @@ def torch_api(
                     )
                 elif val is None:
                     tensor = None
-                elif isinstance(val, TransitionMiniBatch):
+                elif isinstance(val, (TransitionMiniBatch, SteppedTransitionMiniBatch)):
                     tensor = TorchMiniBatch(
                         val,
                         self.device,
